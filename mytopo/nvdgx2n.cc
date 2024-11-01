@@ -35,46 +35,98 @@ const uint32_t NVLINK_BW = 300; // GB/s
 const uint32_t A100_IB_BW = 25; // GB/s
 // TODO: Values probably need to be adjusted
 const uint32_t NVLINK_DELAY = 1; // ms
+const uint32_t IB_DELAY = 1; // ms
 
 void CreateNvlinkTopology(NodeContainer& nodes) {
-    PointToPointHelper pointToPoint;
-    pointToPoint.SetDeviceAttribute("DataRate", StringValue(std::to_string(NVLINK_BW) + "Gbps"));
-    pointToPoint.SetChannelAttribute("Delay", StringValue(std::to_string(NVLINK_DELAY) + "ms"));
+    PointToPointHelper nvLink;
+    nvLink.SetDeviceAttribute("DataRate", StringValue(std::to_string(NVLINK_BW) + "Gbps"));
+    nvLink.SetChannelAttribute("Delay", StringValue(std::to_string(NVLINK_DELAY) + "ms"));
 
+    NetDeviceContainer nvSwitch;
     for (uint32_t i = 0; i < nodes.GetN(); ++i) {
-        for (uint32_t j = 0; j < 8; ++j) {
-            // TODO: Create NVLINK topology within a node
-            NetDeviceContainer devices = pointToPoint.Install(nodes.Get(i), nodes.Get(i));
+        for (uint32_t j = i+1; j < nodes.GetN(); ++j) {
+            // Create NVLINK topology within a node
+            // Normally, each GPU connects through nvLink to nvSwitch
+            // For simplicity, I connect each GPU to other GPUs through nvLink directly
+            // All connects are bidirectional, resulting in a fully connected topo
+            // As I called "nvSwitch" here
+            NetDeviceContainer link = nvLink.Install(nodes.Get(i), nodes.Get(j));
+            nvSwitch.Add(link);
         }
     }
 }
 
+NetDeviceContainer ConnectToIbSwitch(NodeContainer& nodes, Ptr<Node> ibSwitchNode) {
+    PointToPointHelper ibLink;
+    ibLink.SetDeviceAttribute("DataRate", StringValue(std::to_string(A100_IB_BW) + "Gbps"));
+    ibLink.SetChannelAttribute("Delay", StringValue(std::to_string(IB_DELAY) + "ms"));
+
+    // No comment here
+    // refer to topoGraph/a100_topo.py
+    NetDeviceContainer ibSwitchNetDevices;
+    NetDeviceContainer mlx5s;
+    for (uint32_t i = 0; i < nodes.GetN(); ++i) {
+        NetDeviceContainer link = ibLink.Install(nodes.Get(i), ibSwitchNode);
+        mlx5s.Add(link.Get(0));
+        ibSwitchNetDevices.Add(link.Get(1));
+    }
+
+    for (uint32_t i = 0; i < ibSwitchNetDevices.GetN(); ++i) {
+        Ptr<NetDevice> dev = ibSwitchNetDevices.Get(i);
+        Ptr<BridgeNetDevice> bridge = ibSwitchNode->GetDevice(0)->GetObject<BridgeNetDevice>();
+        bridge->AddBridgePort(dev);
+    }
+    return mlx5s;
+}
+
+// TODO: Assign IP address
+void AssignAddressIP(NetDeviceContainer& devices, Ptr<Node> ibSwitchNode, Ipv4AddressHelper& address) {
+    for (uint32_t i = 0; i < devices.GetN(); ++i) {
+        NetDeviceContainer linkDevices;
+        linkDevices.Add(devices.Get(i));
+        linkDevices.Add(ibSwitchNode->GetDevice(i));
+        Ipv4InterfaceContainer interfaces = address.Assign(linkDevices);
+        address.NewNetwork();
+    }
+}
 int main(int argc, char* argv[])
 {
     CommandLine cmd(__FILE__);
     cmd.Parse(argc, argv);
 
-    NodeContainer nodes;
-    nodes.Create(2);
+    // For convience, treat each GPU as a node
+    // Each node has 8 GPUs
+    NodeContainer node0;
+    node0.Create(8);
+    NodeContainer node1;
+    node1.Create(8);
 
-    // TODO : Link Attribute for RDMA
-    PointToPointHelper pointToPoint;
-    // pointToPoint.SetDeviceAttribute("DataRate", StringValue("5Mbps"));
-    // pointToPoint.SetChannelAttribute("Delay", StringValue("2ms"));
+    CreateNvlinkTopology(node0);
+    CreateNvlinkTopology(node1);
 
-    NetDeviceContainer devices;
-    devices = pointToPoint.Install(nodes);
+    // Create a node and install BridgeNetDevice to pretend as IB switch
+    Ptr<Node> ibSwitchNode = CreateObject<Node>();
+    Ptr<BridgeNetDevice> ibSwitch = CreateObject<BridgeNetDevice>();
+    ibSwitchNode->AddDevice(ibSwitch);
 
-    // TODO: set net device attribute for RDMA
-    // Ptr<RdmaApp> rdmaApp = CreateObject<RdmaApp>();
+    // Connect nodes to IB switch
+    NetDeviceContainer node0mlx5s = ConnectToIbSwitch(node0, ibSwitchNode);
+    NetDeviceContainer node1mlx5s = ConnectToIbSwitch(node1, ibSwitchNode);
 
     // Ip addresses assignment
     InternetStackHelper stack;
-    stack.Install(nodes);
+    stack.Install(node0);
+    stack.Install(node1);
 
     Ipv4AddressHelper address;
     address.SetBase("10.1.1.0", "255.255.255.252");
-    Ipv4InterfaceContainer interfaces = address.Assign(devices);
+    AssignAddressIP(node0mlx5s, ibSwitchNode, address);
+    AssignAddressIP(node1mlx5s, ibSwitchNode, address);
+
+    // TODO : Link Attribute for RDMA
+
+    // TODO: set net device attribute for RDMA
+    // Ptr<RdmaApp> rdmaApp = CreateObject<RdmaApp>();
 
     // TODO: Allreduce
     // Ptr<AllreduceApp> app = CreateObject<AllreduceApp>();
